@@ -9,6 +9,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -220,6 +221,25 @@ void free(void *p)
 }
 
 pthread_mutex_t init_mutex = PTHREAD_MUTEX_INITIALIZER;
+const char *dec = "0123456789";
+
+void int_str(int x, char *buff)
+{
+	int m = 1000000000;
+	int i;
+	/* get rid of leading zeros */
+	while (0 == (x/m)) {
+		m /= 10;
+	}
+	i = 0;
+	while (m) {
+		buff[i] = dec[x/m];
+		i++;
+		x %= m;
+		m /= 10;
+	}
+	buff[i] = 0;
+}
 
 static void __init_once()
 {
@@ -230,12 +250,24 @@ static void __init_once()
 	if (initialized)
 		goto out; /* initialized by the other thread */
 	int rc;
+	pid_t pid = getpid();
+	char _pid[64];
+	char _path[PATH_MAX];
 	const char *path = ENV_STR(MEM_TRACK_FILE);
+
+	/* global track_len */
 	track_len = ENV_U64(MEM_TRACK_LEN);
 	assert(track_len > 0);
+
 	size_t map_sz = track_len*sizeof(struct mem_track_entry);
 
-	track_fd = open(path, O_CREAT|O_RDWR, 0644);
+	/* build path */
+	strcpy(_path, path);
+	strcat(_path, ".");
+	int_str(pid, _pid);
+	strcat(_path, _pid);
+
+	track_fd = open(_path, O_CREAT|O_RDWR|O_CLOEXEC, 0644);
 	assert(track_fd >= 0);
 	rc = ftruncate(track_fd, 0);
 	assert(rc >= 0);
