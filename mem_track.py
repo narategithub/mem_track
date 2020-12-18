@@ -2,6 +2,7 @@
 
 import os
 import re
+import pdb
 import sys
 import mmap
 import struct
@@ -17,8 +18,12 @@ p = ap.ArgumentParser(description = "Print memory tracking results from a mem tr
 p.add_argument("MEM_TRACK", nargs=1, help="The memory track file.")
 p.add_argument("--map", "-m",
                help="The map file (to convert caller ptr to symbols")
+p.add_argument("--no-lseek", "-L", action="store_true", default = False,
+               help="Enforce no lseek (default: auto / lseek preferred)")
 
 args = p.parse_args()
+
+print("cmd: ", " ".join(sys.argv))
 
 MemTrackEntry = namedtuple("MemTrackEntry", ["ptr", "sz", "caller"])
 Ent = struct.Struct("PNP")
@@ -122,30 +127,80 @@ class MemoryMap(object):
 
     def get_symbol(self, addr):
         rec = self.find_rec(addr)
+        if not rec:
+            return "{:#x}".format(addr)
         lib_off = addr - rec[BEGIN] + rec[OFFSET]
         if not rec[PATH].startswith("/"):
             return "{}+{:#x}".format(rec[PATH], lib_off)
         tbl = self.symtbl[rec[PATH]]
         return tbl.get_symbol(lib_off)
 
+class MemTrack(object):
+    def __init__(self, path, no_lseek = False):
+        self.fd = os.open(path, os.O_RDONLY)
+        self.mt = mmap.mmap(self.fd, 0, mmap.MAP_SHARED, mmap.PROT_READ)
+        # test if lseek works
+        try:
+            if no_lseek:
+                raise Exception("no lseek") # handle below
+            pos = os.lseek(self.fd, 0, os.SEEK_DATA)
+            print("use lseek")
+            self.can_lseek = True
+        except:
+            print("no lseek")
+            self.can_lseek = False
+
+    def load(self):
+        mem_tracks = dict()
+        for x in self.rec_iter():
+            s = mem_tracks.setdefault(x[CALLER], list())
+            s.append(x)
+        self.mem_tracks = mem_tracks
+
+    def rec_iter_mmap(self):
+        for pos in range(0, len(self.mt), Ent.size):
+            data = self.mt[ pos : pos + Ent.size ]
+            x = Ent.unpack(data)
+            if not x[PTR]:
+                continue # unallocated entry
+            yield x
+        pass
+
+    def rec_iter_lseek(self):
+        # rely on lseek to skip HOLE
+        pos = 0
+        while pos < len(self.mt):
+            try:
+                data_pos = os.lseek(self.fd, pos, os.SEEK_DATA)
+            except:
+                data_pos = len(self.mt)
+            try:
+                hole_pos = os.lseek(self.fd, data_pos, os.SEEK_HOLE)
+            except:
+                hole_pos = len(self.mt)
+            pos = data_pos + (data_pos % Ent.size)
+            while pos < hole_pos:
+                data = self.mt[ pos : pos + Ent.size ]
+                pos += Ent.size
+                x = Ent.unpack(data)
+                if not x[PTR]:
+                    continue # unallocated entry
+                yield x
+
+    def rec_iter(self):
+        return self.rec_iter_lseek() if self.can_lseek else self.rec_iter_mmap()
+
 
 mp = MemoryMap(args.map) if args.map else None
 
-f = open(args.MEM_TRACK[0], "rb")
-mt = mmap.mmap(f.fileno(), 0, mmap.MAP_SHARED,
-                              mmap.PROT_READ|mmap.PROT_WRITE,
-                              mmap.ACCESS_READ|mmap.ACCESS_WRITE)
+mt = MemTrack(args.MEM_TRACK[0], args.no_lseek)
+mt.load()
 
-mem_tracks = dict() # track memory by caller
-for off in range(0, len(mt), Ent.size ):
-    data = mt[ off : off + Ent.size ]
-    x = Ent.unpack(data)
-    if not x[PTR]:
-        continue # unallocated entry
-    s = mem_tracks.setdefault(x[CALLER], list())
-    s.append(x)
-for c, l in mem_tracks.items():
-    print("caller:", mp.get_symbol(c))
+callers = list(mt.mem_tracks.keys())
+callers.sort()
+for c in callers:
+    l = mt.mem_tracks[c]
+    print("caller:", mp.get_symbol(c) if mp else hex(c))
     print("  entries:", len(l))
     _sum = 0
     for x in l:
