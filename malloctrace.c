@@ -9,6 +9,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,10 +31,12 @@
 		e?strtoul(e, NULL, 0):(X); \
 	})
 
-static void *(*libc_malloc)(size_t sz) = NULL;
-static void (*libc_free)(void *p) = NULL;
-static void *(*libc_calloc)(size_t n, size_t sz) = NULL;
-static void *(*libc_realloc)(void *p, size_t sz) = NULL;
+extern void *__libc_malloc(size_t sz);
+extern void *__libc_calloc(size_t n, size_t sz);
+extern void *__libc_realloc(void *p, size_t sz);
+extern void __libc_free(void *p);
+
+static void __init_once();
 
 typedef struct mem_track_entry {
 	void *ptr; /* ptr returned to the application. */
@@ -103,28 +106,38 @@ void u64_hex(uint64_t x, char *hex)
 	}
 }
 
+mem_track_entry_t track_alloc(void *ptr)
+{
+	size_t idx, start;
+	start = idx = ((uint64_t)ptr) % track_len;
+	while (0 == __sync_bool_compare_and_swap(&track_array[idx].ptr, 0, ptr)) {
+		idx = (idx+1)%track_len;
+		assert( idx != start ); /* otherwise, ENOMEM */
+	}
+	return &track_array[idx];
+}
+
+void track_release(mem_track_entry_t ent)
+{
+	ent->caller = NULL;
+	ent->sz = 0;
+	ent->ptr = NULL;
+}
+
 void *malloc(size_t sz)
 {
-	/*
-	 * Add extra 8 bytes to the request sz for mem_track reference.
-	 */
-	size_t idx, start;
-	mem_t m = libc_malloc(sz + sizeof(*m));
+	__init_once();
+	mem_t m = __libc_malloc(sz + sizeof(*m));
 	if (!m)
 		return NULL;
 	WRITE("DEBUG malloc ");
 	WRITE_CALLER(0);
 	WRITE("\n");
 	/* allocate track entry */
-	start = idx = ((uint64_t)m->ptr) % track_len;
-	while (0 == __sync_bool_compare_and_swap(&track_array[idx].ptr, 0, m->ptr)) {
-		idx = (idx+1)%track_len;
-		assert( idx != start ); /* otherwise, ENOMEM */
-	}
 	Dl_info _inf;
 	dladdr(RETURN_ADDR(0), &_inf);
 	m->sig = SIGNATURE;
-	m->track = &track_array[idx];
+	m->track = track_alloc(m->ptr); /* already set track->ptr */
 	m->track->sz = sz;
 	m->track->caller = _inf.dli_saddr;
 	return m->ptr;
@@ -132,14 +145,56 @@ void *malloc(size_t sz)
 
 void *calloc(size_t n, size_t sz)
 {
-	WRITE("DEBUG calloc\n");
-	return libc_calloc(n, sz);
+	__init_once();
+	mem_t m = __libc_calloc(1, n*sz + sizeof(*m));
+	if (!m)
+		return NULL;
+	WRITE("DEBUG calloc ");
+	WRITE_CALLER(0);
+	WRITE("\n");
+	/* allocate track entry */
+	Dl_info _inf;
+	dladdr(RETURN_ADDR(0), &_inf);
+	m->sig = SIGNATURE;
+	m->track = track_alloc(m->ptr); /* already set track->ptr */
+	m->track->sz = sz;
+	m->track->caller = _inf.dli_saddr;
+	return m->ptr;
 }
 
 void *realloc(void *p, size_t sz)
 {
-	WRITE("DEBUG realloc\n");
-	return  libc_realloc(p, sz);
+	__init_once();
+	if (!p) {
+		/* this is just mlloc */
+		mem_t m = __libc_malloc(sz + sizeof(*m));
+		if (!m)
+			return NULL;
+		WRITE("DEBUG realloc ");
+		WRITE_CALLER(0);
+		WRITE("\n");
+		/* allocate track entry */
+		Dl_info _inf;
+		dladdr(RETURN_ADDR(0), &_inf);
+		m->sig = SIGNATURE;
+		m->track = track_alloc(m->ptr); /* already set track->ptr */
+		m->track->sz = sz;
+		m->track->caller = _inf.dli_saddr;
+		return m->ptr;
+	}
+
+	mem_t m = p - sizeof(*m);
+	mem_t new_m = __libc_realloc(m, sz + sizeof(*m));
+	if (new_m != m) {
+		track_release(new_m->track);
+		new_m->track = track_alloc(new_m->ptr);
+	}
+	Dl_info _inf;
+	dladdr(RETURN_ADDR(0), &_inf);
+	new_m->track->sz = sz;
+	new_m->track->caller = _inf.dli_saddr;
+
+	return  new_m->ptr;
 }
 
 void free(void *p)
@@ -161,13 +216,20 @@ void free(void *p)
 	m->track->sz = 0;
 	m->track->ptr = 0;
 	/* free */
-	libc_free(m);
+	__libc_free(m);
 }
 
-static void __attribute__((constructor)) __init__()
+pthread_mutex_t init_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void __init_once()
 {
+	static int initialized = 0;
+	if (initialized)
+		return;
+	pthread_mutex_lock(&init_mutex);
+	if (initialized)
+		goto out; /* initialized by the other thread */
 	int rc;
-	uint64_t i;
 	const char *path = ENV_STR(MEM_TRACK_FILE);
 	track_len = ENV_U64(MEM_TRACK_LEN);
 	assert(track_len > 0);
@@ -182,12 +244,18 @@ static void __attribute__((constructor)) __init__()
 
 	track_array = mmap(NULL, map_sz, PROT_READ|PROT_WRITE, MAP_SHARED, track_fd, 0);
 	assert(track_array != MAP_FAILED);
+	#if 0
 	for (i = 0; i < track_len; i++) {
 		assert(track_array[i].ptr == 0);
 		assert(track_array[i].caller == 0);
 	}
-	libc_malloc = dlsym(RTLD_NEXT, "malloc");
-	libc_calloc = dlsym(RTLD_NEXT, "calloc");
-	libc_realloc = dlsym(RTLD_NEXT, "realloc");
-	libc_free = dlsym(RTLD_NEXT, "free");
+	#endif
+	initialized = 1;
+ out:
+	pthread_mutex_unlock(&init_mutex);
+}
+
+static void __attribute__((constructor)) __init__()
+{
+	__init_once();
 }
